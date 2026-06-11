@@ -10,6 +10,7 @@ export interface CliInput {
   prompt: string;
   model: ClaudeModel;
   sessionId?: string;
+  systemPrompt?: string;
 }
 
 const MODEL_MAP: Record<string, ClaudeModel> = {
@@ -17,9 +18,12 @@ const MODEL_MAP: Record<string, ClaudeModel> = {
   "claude-opus-4": "opus",
   "claude-sonnet-4": "sonnet",
   "claude-haiku-4": "haiku",
-  // 4.5/4.6 generation
+  // 4.7 generation (latest)
+  "claude-opus-4-7": "claude-opus-4-7",
+  // 4.6 generation
   "claude-opus-4-6": "claude-opus-4-6",
   "claude-sonnet-4-6": "claude-sonnet-4-6",
+  // 4.5 generation
   "claude-sonnet-4-5": "claude-sonnet-4-5",
   "claude-haiku-4-5": "claude-haiku-4-5",
   // With provider prefix (claude-code-cli/)
@@ -59,8 +63,11 @@ export function extractModel(model: string): ClaudeModel {
     return MODEL_MAP[stripped];
   }
 
-  // Default to opus (Claude Max subscription)
-  return "opus";
+  // Passthrough: pass model name as-is to Claude CLI
+  // This way new models (e.g. claude-opus-4-8) work automatically
+  // without needing to update the proxy
+  const alsoStripped = model.replace(/^(claude-proxy|claude-code-cli)\//, "");
+  return alsoStripped || model;
 }
 
 /**
@@ -96,8 +103,9 @@ export function messagesToPrompt(messages: OpenAIChatRequest["messages"]): strin
     switch (msg.role) {
       case "system":
       case "developer":
-        // System/developer messages become context instructions
-        parts.push(`<system>\n${text}\n</system>\n`);
+        // System/developer messages are forwarded via the CLI's --system-prompt
+        // flag (see systemPromptFrom), NOT embedded in the user prompt — otherwise
+        // the CLI's own default identity overrides them. Skip here.
         break;
 
       case "user":
@@ -116,6 +124,20 @@ export function messagesToPrompt(messages: OpenAIChatRequest["messages"]): strin
 }
 
 /**
+ * Concatenate all system/developer messages into a single system prompt string.
+ * Forwarded to the CLI via --system-prompt so it fully overrides the default
+ * Claude Code identity (otherwise the model ignores the requested persona).
+ */
+export function systemPromptFrom(messages: OpenAIChatRequest["messages"]): string | undefined {
+  const sys = messages
+    .filter((m) => m.role === "system" || m.role === "developer")
+    .map((m) => extractContentText(m.content))
+    .filter((t) => t.trim().length > 0)
+    .join("\n\n");
+  return sys.length > 0 ? sys : undefined;
+}
+
+/**
  * Convert OpenAI chat request to CLI input format
  */
 export function openaiToCli(request: OpenAIChatRequest): CliInput {
@@ -123,5 +145,6 @@ export function openaiToCli(request: OpenAIChatRequest): CliInput {
     prompt: messagesToPrompt(request.messages),
     model: extractModel(request.model),
     sessionId: request.user, // Use OpenAI's user field for session mapping
+    systemPrompt: systemPromptFrom(request.messages),
   };
 }

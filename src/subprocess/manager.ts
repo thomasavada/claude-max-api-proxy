@@ -23,6 +23,7 @@ export interface SubprocessOptions {
   sessionId?: string;
   cwd?: string;
   timeout?: number;
+  systemPrompt?: string;
 }
 
 export interface SubprocessEvents {
@@ -140,6 +141,12 @@ export class ClaudeSubprocess extends EventEmitter {
       options.model, // Model alias (opus/sonnet/haiku)
       "--no-session-persistence", // Don't save sessions
     ];
+
+    // Full system-prompt override — replaces the CLI's default Claude Code identity
+    // so the requested persona (e.g. a domain assistant) actually takes effect.
+    if (options.systemPrompt) {
+      args.push("--system-prompt", options.systemPrompt);
+    }
 
     // Support headless operation without permission prompts
     if (process.env.CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS === "true") {

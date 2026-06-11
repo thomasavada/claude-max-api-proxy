@@ -179,6 +179,7 @@ async function handleStreamingResponse(
     subprocess.start(cliInput.prompt, {
       model: cliInput.model,
       sessionId: cliInput.sessionId,
+      systemPrompt: cliInput.systemPrompt,
     }).catch((err) => {
       console.error("[Streaming] Subprocess start error:", err);
       reject(err);
@@ -234,6 +235,7 @@ async function handleNonStreamingResponse(
       .start(cliInput.prompt, {
         model: cliInput.model,
         sessionId: cliInput.sessionId,
+        systemPrompt: cliInput.systemPrompt,
       })
       .catch((error) => {
         res.status(500).json({
@@ -249,34 +251,43 @@ async function handleNonStreamingResponse(
 }
 
 /**
+ * Known Claude models — keep this list updated as Anthropic releases new versions.
+ *
+ * Passthrough note: ANY model ID sent to /v1/chat/completions is forwarded as-is
+ * to the CLI even if it doesn't appear here (see extractModel in adapter).
+ * This list only affects what shows up in GET /v1/models.
+ * Last updated: 2026-06 (claude-opus-4-8 added, 1M context window)
+ */
+const MODELS = [
+  // Claude 4.8 (latest, 1M context)
+  "claude-opus-4-8",
+  // Claude 4.7
+  "claude-opus-4-7",
+  // Claude 4.6
+  "claude-opus-4-6",
+  "claude-sonnet-4-6",
+  "claude-haiku-4-6",
+  // Claude 4.5
+  "claude-opus-4-5",
+  "claude-sonnet-4-5",
+  "claude-haiku-4-5",
+  // Claude 4 base
+  "claude-opus-4",
+  "claude-sonnet-4",
+  "claude-haiku-4",
+];
+
+/**
  * Handle GET /v1/models
  *
- * Returns available models
+ * Returns the known model list. Any model not in this list can still be used
+ * via /v1/chat/completions — unknown model IDs are passed through directly to
+ * the Claude CLI, so new releases work automatically without proxy changes.
  */
-export function handleModels(_req: Request, res: Response): void {
-  res.json({
-    object: "list",
-    data: [
-      {
-        id: "claude-opus-4",
-        object: "model",
-        owned_by: "anthropic",
-        created: Math.floor(Date.now() / 1000),
-      },
-      {
-        id: "claude-sonnet-4",
-        object: "model",
-        owned_by: "anthropic",
-        created: Math.floor(Date.now() / 1000),
-      },
-      {
-        id: "claude-haiku-4",
-        object: "model",
-        owned_by: "anthropic",
-        created: Math.floor(Date.now() / 1000),
-      },
-    ],
-  });
+export async function handleModels(_req: Request, res: Response): Promise<void> {
+  const created = Math.floor(Date.now() / 1000);
+  const models = MODELS.map((id) => ({ id, object: "model", owned_by: "anthropic", created }));
+  res.json({ object: "list", data: models });
 }
 
 /**
