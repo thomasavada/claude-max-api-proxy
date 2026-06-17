@@ -57,8 +57,8 @@ export function extractModel(model: string): ClaudeModel {
     return MODEL_MAP[model];
   }
 
-  // Try stripping provider prefix
-  const stripped = model.replace(/^claude-code-cli\//, "");
+  // Try stripping any provider prefix (claude-code-cli/, claude-proxy/, claude-max/, ...)
+  const stripped = model.replace(/^[^/]+\//, "");
   if (MODEL_MAP[stripped]) {
     return MODEL_MAP[stripped];
   }
@@ -66,8 +66,7 @@ export function extractModel(model: string): ClaudeModel {
   // Passthrough: pass model name as-is to Claude CLI
   // This way new models (e.g. claude-opus-4-8) work automatically
   // without needing to update the proxy
-  const alsoStripped = model.replace(/^(claude-proxy|claude-code-cli)\//, "");
-  return alsoStripped || model;
+  return stripped || model;
 }
 
 /**
