@@ -45,6 +45,23 @@ function createApp(): Express {
     res.sendStatus(200);
   });
 
+  // Auth middleware: require Bearer token only for external (Cloudflare tunnel)
+  // requests. Local network requests (no CF-Ray header) are allowed without auth
+  // so on-machine OpenClaw / LAN clients can call freely.
+  const API_KEY = process.env.PROXY_API_KEY;
+  if (API_KEY) {
+    app.use((req: Request, res: Response, next: NextFunction) => {
+      const isTunnel = !!req.headers["cf-ray"];
+      if (!isTunnel) return next(); // local network — skip auth
+      const auth = (req.headers["authorization"] as string) || "";
+      const token = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
+      if (token === API_KEY) return next();
+      res
+        .status(401)
+        .json({ error: { message: "Unauthorized", type: "auth_error", code: null } });
+    });
+  }
+
   // Routes
   app.get("/health", handleHealth);
   app.get("/v1/models", handleModels);

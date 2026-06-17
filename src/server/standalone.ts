@@ -45,7 +45,7 @@ async function main(): Promise<void> {
 
   // Start server
   try {
-    await startServer({ port });
+    await startServer({ port, host: "0.0.0.0" });
     console.log("\nServer ready. Test with:");
     console.log(`  curl -X POST http://localhost:${port}/v1/chat/completions \\`);
     console.log(`    -H "Content-Type: application/json" \\`);

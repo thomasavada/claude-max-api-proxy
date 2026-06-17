@@ -14,6 +14,69 @@ import {
 } from "../adapter/cli-to-openai.js";
 import type { OpenAIChatRequest } from "../types/openai.js";
 import type { ClaudeCliAssistant, ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
+import { execSync } from "child_process";
+
+// ─── Dynamic model list ────────────────────────────────────────────────────────
+// Fetches available models from the Claude CLI at runtime so new releases
+// (e.g. claude-opus-4-9, 1M+ context) show up automatically without code changes.
+// Cached for 1h; falls back to a known-good list if the CLI is unavailable.
+
+const FALLBACK_MODEL_IDS = [
+  "claude-opus-4-8",
+  "claude-opus-4-7",
+  "claude-opus-4-6",
+  "claude-sonnet-4-6",
+  "claude-sonnet-4-5",
+  "claude-haiku-4-6",
+  "claude-haiku-4-5",
+  "claude-haiku-4-5-20251001",
+  "claude-opus-4-5",
+  "claude-opus-4",
+  "claude-sonnet-4",
+  "claude-haiku-4",
+];
+
+let _cachedModels: string[] | null = null;
+let _cacheExpiry = 0;
+const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+function fetchModelsFromCli(): string[] {
+  try {
+    const output = execSync("claude models", {
+      timeout: 12000,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        // Cover both Mac mini (homebrew) and Pi (npm-global) claude locations
+        PATH: `${process.env.PATH ?? ""}:/opt/homebrew/bin:/home/thomas/.npm-global/bin:/usr/local/bin`,
+      },
+    });
+    // Extract backtick-quoted claude-* identifiers from CLI output
+    const matches = output.match(/`(claude-[a-z0-9-[\]]+)`/g) ?? [];
+    const ids = [...new Set(matches.map((m) => m.replace(/`|\[.*?\]/g, "")))].filter(
+      (id) => id.startsWith("claude-")
+    );
+    if (ids.length > 0) {
+      console.log(`[models] Fetched ${ids.length} models from CLI: ${ids.join(", ")}`);
+      return ids;
+    }
+  } catch (err) {
+    console.warn("[models] CLI fetch failed, using fallback:", (err as Error).message);
+  }
+  return FALLBACK_MODEL_IDS;
+}
+
+function getModels(): string[] {
+  const now = Date.now();
+  if (!_cachedModels || now > _cacheExpiry) {
+    _cachedModels = fetchModelsFromCli();
+    _cacheExpiry = now + CACHE_TTL_MS;
+  }
+  return _cachedModels;
+}
+
+// Pre-warm model cache on startup (non-blocking)
+setTimeout(() => getModels(), 1000);
 
 /**
  * Handle POST /v1/chat/completions
@@ -251,42 +314,16 @@ async function handleNonStreamingResponse(
 }
 
 /**
- * Known Claude models — keep this list updated as Anthropic releases new versions.
- *
- * Passthrough note: ANY model ID sent to /v1/chat/completions is forwarded as-is
- * to the CLI even if it doesn't appear here (see extractModel in adapter).
- * This list only affects what shows up in GET /v1/models.
- * Last updated: 2026-06 (claude-opus-4-8 added, 1M context window)
- */
-const MODELS = [
-  // Claude 4.8 (latest, 1M context)
-  "claude-opus-4-8",
-  // Claude 4.7
-  "claude-opus-4-7",
-  // Claude 4.6
-  "claude-opus-4-6",
-  "claude-sonnet-4-6",
-  "claude-haiku-4-6",
-  // Claude 4.5
-  "claude-opus-4-5",
-  "claude-sonnet-4-5",
-  "claude-haiku-4-5",
-  // Claude 4 base
-  "claude-opus-4",
-  "claude-sonnet-4",
-  "claude-haiku-4",
-];
-
-/**
  * Handle GET /v1/models
  *
- * Returns the known model list. Any model not in this list can still be used
- * via /v1/chat/completions — unknown model IDs are passed through directly to
- * the Claude CLI, so new releases work automatically without proxy changes.
+ * Returns the model list fetched dynamically from the Claude CLI (cached 1h),
+ * so new releases appear automatically. Any model ID sent to
+ * /v1/chat/completions is forwarded as-is even if not listed here, so unknown
+ * models still work via passthrough.
  */
 export async function handleModels(_req: Request, res: Response): Promise<void> {
   const created = Math.floor(Date.now() / 1000);
-  const models = MODELS.map((id) => ({ id, object: "model", owned_by: "anthropic", created }));
+  const models = getModels().map((id) => ({ id, object: "model", owned_by: "anthropic", created }));
   res.json({ object: "list", data: models });
 }
 
