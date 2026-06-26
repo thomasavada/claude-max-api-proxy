@@ -110,6 +110,25 @@ curl -N -X POST http://localhost:3456/v1/chat/completions \
 | `/v1/models` | GET | List available models |
 | `/v1/chat/completions` | POST | Chat completions (streaming & non-streaming) |
 
+## Tuning for long-running tasks
+
+Long agentic tasks can stream for many minutes with silent "thinking" gaps. The
+proxy keeps these connections healthy by (1) sending periodic SSE heartbeats so
+idle sockets aren't dropped, (2) disabling Node's default HTTP timeouts, and (3)
+using an **idle** timeout that only kills a subprocess after a stretch of *no
+output* — an actively streaming task is never killed. These are tunable via env:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLAUDE_IDLE_TIMEOUT_MS` | `300000` (5 min) | Kill the CLI only after this long with **no output**. Resets on every chunk, so active tasks run indefinitely. |
+| `CLAUDE_MAX_TIMEOUT_MS` | `0` (off) | Optional absolute wall-clock cap on a single request. `0` disables it. |
+| `CLAUDE_KILL_GRACE_MS` | `5000` | Grace period after `SIGTERM` before escalating to `SIGKILL` (prevents zombie CLIs). |
+| `CLAUDE_SSE_HEARTBEAT_MS` | `15000` | Interval between SSE keep-alive comments during streaming. |
+| `CLAUDE_CLI_BIN` | `claude` | Path/name of the Claude CLI binary to spawn. |
+
+> The model list is fetched from the CLI **asynchronously** and served from a
+> cache, so refreshing it never blocks in-flight requests.
+
 ## Available Models
 
 | Model ID | Maps To |

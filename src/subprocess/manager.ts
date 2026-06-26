@@ -35,46 +35,62 @@ export interface SubprocessEvents {
   raw: (line: string) => void;
 }
 
-const DEFAULT_TIMEOUT = 900000; // 15 minutes (agentic tasks can be long)
+// Timeout model — see DESIGN/README. We DON'T kill long-but-active tasks.
+// The idle timer resets on every chunk of output, so a task that is actively
+// streaming runs as long as it keeps producing output. Only genuinely stuck
+// processes (no output for IDLE_TIMEOUT) are killed. An optional hard cap
+// bounds total wall-clock time and is OFF by default (0).
+const IDLE_TIMEOUT = Number(process.env.CLAUDE_IDLE_TIMEOUT_MS) || 300000; // 5 min of silence
+const MAX_TIMEOUT = Number(process.env.CLAUDE_MAX_TIMEOUT_MS) || 0; // 0 = no hard cap
+const KILL_GRACE = Number(process.env.CLAUDE_KILL_GRACE_MS) || 5000; // SIGTERM→SIGKILL grace
+// Allow pointing at a specific Claude binary (mirrors the PATH handling used
+// for `claude models` in routes.ts, and lets tests inject a fake CLI).
+const CLI_BIN = process.env.CLAUDE_CLI_BIN || "claude";
 
 export class ClaudeSubprocess extends EventEmitter {
   private process: ChildProcess | null = null;
   private buffer: string = "";
-  private timeoutId: NodeJS.Timeout | null = null;
+  private idleTimeoutId: NodeJS.Timeout | null = null;
+  private maxTimeoutId: NodeJS.Timeout | null = null;
+  private forceKillId: NodeJS.Timeout | null = null;
   private isKilled: boolean = false;
+  private idleMs: number = IDLE_TIMEOUT;
 
   /**
    * Start the Claude CLI subprocess with the given prompt
    */
   async start(prompt: string, options: SubprocessOptions): Promise<void> {
     const args = this.buildArgs(options);
-    const timeout = options.timeout || DEFAULT_TIMEOUT;
+    // Backward-compat: an explicit options.timeout is treated as the idle window.
+    this.idleMs = options.timeout || IDLE_TIMEOUT;
 
     return new Promise((resolve, reject) => {
       try {
         // Use spawn() for security - no shell interpretation
-        this.process = spawn("claude", args, {
+        this.process = spawn(CLI_BIN, args, {
           cwd: options.cwd || process.cwd(),
           env: { ...process.env, OPENCLAW_PROXY: "1" },
           stdio: ["pipe", "pipe", "pipe"],
         });
 
-        // Set timeout
-        this.timeoutId = setTimeout(() => {
-          if (!this.isKilled) {
-            this.isKilled = true;
-            this.process?.kill("SIGTERM");
-            this.emit("error", new Error(`Request timed out after ${timeout}ms`));
-          }
-        }, timeout);
+        // Idle timeout: fires only after idleMs of NO output. Reset on every
+        // chunk (see stdout/stderr handlers) so active tasks are never killed.
+        this.resetIdleTimer();
+
+        // Optional hard cap on total wall-clock time (off by default).
+        if (MAX_TIMEOUT > 0) {
+          this.maxTimeoutId = setTimeout(() => {
+            this.handleTimeout(`Request exceeded hard cap of ${MAX_TIMEOUT}ms`);
+          }, MAX_TIMEOUT);
+        }
 
         // Handle spawn errors (e.g., claude not found)
         this.process.on("error", (err) => {
-          this.clearTimeout();
+          this.clearTimers();
           if (err.message.includes("ENOENT")) {
             reject(
               new Error(
-                "Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code"
+                `Claude CLI ("${CLI_BIN}") not found. Install with: npm install -g @anthropic-ai/claude-code`
               )
             );
           } else {
@@ -90,6 +106,7 @@ export class ClaudeSubprocess extends EventEmitter {
 
         // Parse JSON stream from stdout
         this.process.stdout?.on("data", (chunk: Buffer) => {
+          this.resetIdleTimer(); // activity — the task is alive, don't time out
           const data = chunk.toString();
           console.error(`[Subprocess] Received ${data.length} bytes of stdout`);
           this.buffer += data;
@@ -98,6 +115,7 @@ export class ClaudeSubprocess extends EventEmitter {
 
         // Capture stderr for debugging
         this.process.stderr?.on("data", (chunk: Buffer) => {
+          this.resetIdleTimer(); // stderr output also counts as activity
           const errorText = chunk.toString().trim();
           if (errorText) {
             // Don't emit as error unless it's actually an error
@@ -109,7 +127,7 @@ export class ClaudeSubprocess extends EventEmitter {
         // Handle process close
         this.process.on("close", (code) => {
           console.error(`[Subprocess] Process closed with code: ${code}`);
-          this.clearTimeout();
+          this.clearTimers();
           // Process any remaining buffer
           if (this.buffer.trim()) {
             this.processBuffer();
@@ -120,10 +138,52 @@ export class ClaudeSubprocess extends EventEmitter {
         // Resolve immediately since we're streaming
         resolve();
       } catch (err) {
-        this.clearTimeout();
+        this.clearTimers();
         reject(err);
       }
     });
+  }
+
+  /**
+   * (Re)arm the idle timer. Called on spawn and on every chunk of output, so
+   * the countdown only elapses during genuine silence from the subprocess.
+   */
+  private resetIdleTimer(): void {
+    if (this.isKilled) return;
+    if (this.idleTimeoutId) clearTimeout(this.idleTimeoutId);
+    this.idleTimeoutId = setTimeout(() => {
+      this.handleTimeout(`No output for ${this.idleMs}ms (process appears stuck)`);
+    }, this.idleMs);
+  }
+
+  /**
+   * Common path for idle / hard-cap timeouts: mark killed, escalate the kill,
+   * and surface a clear error so the caller can close the stream cleanly.
+   */
+  private handleTimeout(reason: string): void {
+    if (this.isKilled) return;
+    this.isKilled = true;
+    this.escalateKill();
+    this.emit("error", new Error(`Request timed out: ${reason}`));
+  }
+
+  /**
+   * Terminate the process gracefully, then forcibly. SIGTERM lets the CLI flush
+   * and exit; if it's still alive after KILL_GRACE we SIGKILL it so a hung CLI
+   * can never become a zombie holding the request open.
+   */
+  private escalateKill(): void {
+    if (!this.process) return;
+    this.clearTimers();
+    this.process.kill("SIGTERM");
+    this.forceKillId = setTimeout(() => {
+      if (this.process && this.process.exitCode === null && this.process.signalCode === null) {
+        console.error("[Subprocess] SIGTERM grace elapsed — sending SIGKILL");
+        this.process.kill("SIGKILL");
+      }
+    }, KILL_GRACE);
+    // Don't let the force-kill timer keep the event loop alive on shutdown.
+    this.forceKillId.unref?.();
   }
 
   /**
@@ -191,23 +251,28 @@ export class ClaudeSubprocess extends EventEmitter {
   }
 
   /**
-   * Clear the timeout timer
+   * Clear the idle and hard-cap timers (not the force-kill timer, which must
+   * outlive them to guarantee SIGKILL lands).
    */
-  private clearTimeout(): void {
-    if (this.timeoutId) {
-      clearTimeout(this.timeoutId);
-      this.timeoutId = null;
+  private clearTimers(): void {
+    if (this.idleTimeoutId) {
+      clearTimeout(this.idleTimeoutId);
+      this.idleTimeoutId = null;
+    }
+    if (this.maxTimeoutId) {
+      clearTimeout(this.maxTimeoutId);
+      this.maxTimeoutId = null;
     }
   }
 
   /**
-   * Kill the subprocess
+   * Kill the subprocess (e.g. on client disconnect). Uses the same
+   * SIGTERM→SIGKILL escalation so a stuck CLI is always reaped.
    */
-  kill(signal: NodeJS.Signals = "SIGTERM"): void {
+  kill(_signal: NodeJS.Signals = "SIGTERM"): void {
     if (!this.isKilled && this.process) {
       this.isKilled = true;
-      this.clearTimeout();
-      this.process.kill(signal);
+      this.escalateKill();
     }
   }
 

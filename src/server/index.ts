@@ -109,6 +109,17 @@ export async function startServer(config: ServerConfig): Promise<Server> {
   return new Promise((resolve, reject) => {
     serverInstance = createServer(app);
 
+    // Long-running agentic tasks can stream for many minutes. Node's default
+    // timeouts would cut these connections mid-task (which surfaces to clients
+    // like OpenClaw as "sorry, something happened"). We disable the request /
+    // header / socket-inactivity ceilings and govern task duration at the
+    // subprocess (idle-timeout) layer instead. keepAliveTimeout is raised above
+    // typical 60s idle thresholds so pooled connections aren't reaped early.
+    serverInstance.requestTimeout = 0; // no ceiling on total request time
+    serverInstance.headersTimeout = 0; // don't cut while awaiting headers
+    serverInstance.timeout = 0; // no socket inactivity timeout
+    serverInstance.keepAliveTimeout = 75_000;
+
     serverInstance.on("error", (err: NodeJS.ErrnoException) => {
       if (err.code === "EADDRINUSE") {
         reject(new Error(`Port ${port} is already in use`));
