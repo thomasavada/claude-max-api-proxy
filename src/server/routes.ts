@@ -14,7 +14,7 @@ import {
 } from "../adapter/cli-to-openai.js";
 import type { OpenAIChatRequest } from "../types/openai.js";
 import type { ClaudeCliAssistant, ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
-import { execSync } from "child_process";
+import { execFile } from "child_process";
 
 // ─── Dynamic model list ────────────────────────────────────────────────────────
 // Fetches available models from the Claude CLI at runtime so new releases
@@ -36,13 +36,35 @@ const FALLBACK_MODEL_IDS = [
   "claude-haiku-4",
 ];
 
-let _cachedModels: string[] | null = null;
+// Start from the known-good list so we ALWAYS have an answer without blocking.
+let _cachedModels: string[] = FALLBACK_MODEL_IDS;
 let _cacheExpiry = 0;
+let _refreshing = false;
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+const FAILURE_RETRY_MS = 60 * 1000; // back off briefly after a failed fetch
+const CLI_BIN = process.env.CLAUDE_CLI_BIN || "claude";
 
-function fetchModelsFromCli(): string[] {
-  try {
-    const output = execSync("claude models", {
+// SSE heartbeat: during long silent gaps (Claude "thinking" on an agentic
+// task) we send an SSE comment so the socket stays warm and clients/proxies
+// don't drop it as idle. Comments are ignored by OpenAI-compatible clients.
+const SSE_HEARTBEAT_MS = Number(process.env.CLAUDE_SSE_HEARTBEAT_MS) || 15000;
+
+/**
+ * Refresh the model list in the background.
+ *
+ * CRITICAL: this MUST stay async. The previous implementation used execSync,
+ * which blocks Node's single-threaded event loop for up to 12s on every cache
+ * refresh — freezing all in-flight streaming responses (no data, no heartbeat)
+ * and causing client timeouts. execFile runs out-of-band; the cache is updated
+ * via callback and requests always read whatever is currently cached.
+ */
+function refreshModelsInBackground(): void {
+  if (_refreshing) return;
+  _refreshing = true;
+  execFile(
+    CLI_BIN,
+    ["models"],
+    {
       timeout: 12000,
       encoding: "utf8",
       env: {
@@ -50,33 +72,41 @@ function fetchModelsFromCli(): string[] {
         // Cover both Mac mini (homebrew) and Pi (npm-global) claude locations
         PATH: `${process.env.PATH ?? ""}:/opt/homebrew/bin:/home/thomas/.npm-global/bin:/usr/local/bin`,
       },
-    });
-    // Extract backtick-quoted claude-* identifiers from CLI output
-    const matches = output.match(/`(claude-[a-z0-9-[\]]+)`/g) ?? [];
-    const ids = [...new Set(matches.map((m) => m.replace(/`|\[.*?\]/g, "")))].filter(
-      (id) => id.startsWith("claude-")
-    );
-    if (ids.length > 0) {
-      console.log(`[models] Fetched ${ids.length} models from CLI: ${ids.join(", ")}`);
-      return ids;
+    },
+    (err, stdout) => {
+      _refreshing = false;
+      if (err) {
+        console.warn("[models] CLI fetch failed, keeping current list:", err.message);
+        _cacheExpiry = Date.now() + FAILURE_RETRY_MS; // retry sooner, don't hammer
+        return;
+      }
+      // Extract backtick-quoted claude-* identifiers from CLI output
+      const matches = stdout.match(/`(claude-[a-z0-9-[\]]+)`/g) ?? [];
+      const ids = [...new Set(matches.map((m) => m.replace(/`|\[.*?\]/g, "")))].filter(
+        (id) => id.startsWith("claude-")
+      );
+      _cacheExpiry = Date.now() + CACHE_TTL_MS;
+      if (ids.length > 0) {
+        _cachedModels = ids;
+        console.log(`[models] Refreshed ${ids.length} models from CLI: ${ids.join(", ")}`);
+      }
     }
-  } catch (err) {
-    console.warn("[models] CLI fetch failed, using fallback:", (err as Error).message);
-  }
-  return FALLBACK_MODEL_IDS;
+  );
 }
 
+/**
+ * Return the cached model list immediately (never blocks). Kicks off a
+ * background refresh when the cache is stale.
+ */
 function getModels(): string[] {
-  const now = Date.now();
-  if (!_cachedModels || now > _cacheExpiry) {
-    _cachedModels = fetchModelsFromCli();
-    _cacheExpiry = now + CACHE_TTL_MS;
+  if (Date.now() > _cacheExpiry) {
+    refreshModelsInBackground();
   }
   return _cachedModels;
 }
 
-// Pre-warm model cache on startup (non-blocking)
-setTimeout(() => getModels(), 1000);
+// Pre-warm model cache on startup (non-blocking, off the event loop)
+setTimeout(() => refreshModelsInBackground(), 1000);
 
 /**
  * Handle POST /v1/chat/completions
@@ -161,8 +191,24 @@ async function handleStreamingResponse(
     let lastModel = "claude-sonnet-4";
     let isComplete = false;
 
+    // Keep the connection warm through long silent gaps. Cleared in every
+    // terminal path below so we never write to an ended response.
+    let heartbeat: NodeJS.Timeout | null = setInterval(() => {
+      if (!res.writableEnded) {
+        res.write(`: ping ${Date.now()}\n\n`);
+      }
+    }, SSE_HEARTBEAT_MS);
+    heartbeat.unref?.();
+    const stopHeartbeat = () => {
+      if (heartbeat) {
+        clearInterval(heartbeat);
+        heartbeat = null;
+      }
+    };
+
     // Handle actual client disconnect (response stream closed)
     res.on("close", () => {
+      stopHeartbeat();
       if (!isComplete) {
         // Client disconnected before response completed - kill subprocess
         subprocess.kill();
@@ -200,6 +246,7 @@ async function handleStreamingResponse(
 
     subprocess.on("result", (_result: ClaudeCliResult) => {
       isComplete = true;
+      stopHeartbeat();
       if (!res.writableEnded) {
         // Send final done chunk with finish_reason
         const doneChunk = createDoneChunk(requestId, lastModel);
@@ -212,6 +259,7 @@ async function handleStreamingResponse(
 
     subprocess.on("error", (error: Error) => {
       console.error("[Streaming] Error:", error.message);
+      stopHeartbeat();
       if (!res.writableEnded) {
         res.write(
           `data: ${JSON.stringify({
@@ -225,6 +273,7 @@ async function handleStreamingResponse(
 
     subprocess.on("close", (code: number | null) => {
       // Subprocess exited - ensure response is closed
+      stopHeartbeat();
       if (!res.writableEnded) {
         if (code !== 0 && !isComplete) {
           // Abnormal exit without result - send error
