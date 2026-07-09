@@ -24,6 +24,12 @@ export interface SubprocessOptions {
   cwd?: string;
   timeout?: number;
   systemPrompt?: string;
+  /**
+   * OpenAI tool-calling emulation mode. Disables the CLI's own tools and
+   * dynamic system-prompt sections so the model can only emit the text
+   * tool-call contract we injected. See adapter/tools.ts.
+   */
+  toolMode?: boolean;
 }
 
 export interface SubprocessEvents {
@@ -201,6 +207,17 @@ export class ClaudeSubprocess extends EventEmitter {
       options.model, // Model alias (opus/sonnet/haiku)
       "--no-session-persistence", // Don't save sessions
     ];
+
+    // Tool-calling emulation: strip the CLI's own agent capabilities so the
+    // model can only produce the text tool-call contract we injected. Without
+    // this the CLI would (a) expose its own Read/Write/Bash/MCP tools and try to
+    // *execute* them in its agent loop instead of handing a call back, and
+    // (b) prepend a ~14k-token identity preamble that fights our contract.
+    if (options.toolMode) {
+      args.push("--tools", ""); // disable ALL built-in tools
+      args.push("--strict-mcp-config"); // ignore ambient MCP servers (no --mcp-config given)
+      args.push("--exclude-dynamic-system-prompt-sections"); // drop the large default preamble
+    }
 
     // Full system-prompt override — replaces the CLI's default Claude Code identity
     // so the requested persona (e.g. a domain assistant) actually takes effect.

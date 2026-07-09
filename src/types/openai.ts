@@ -14,9 +14,44 @@ export interface OpenAIContentPart {
 
 export type OpenAIMessageContent = string | OpenAIContentPart[] | null;
 
+// ─── Tool / function-calling types (OpenAI Chat Completions spec) ───────────────
+
+export interface OpenAIFunctionDef {
+  name: string;
+  description?: string;
+  parameters?: Record<string, unknown>; // JSON Schema
+}
+
+export interface OpenAITool {
+  type: "function";
+  function: OpenAIFunctionDef;
+}
+
+export interface OpenAIToolCall {
+  id: string;
+  type: "function";
+  function: {
+    name: string;
+    arguments: string; // JSON-encoded string, per OpenAI spec
+  };
+}
+
+// "auto" | "none" | "required" | { type: "function", function: { name } }
+export type OpenAIToolChoice =
+  | "auto"
+  | "none"
+  | "required"
+  | { type: "function"; function: { name: string } };
+
 export interface OpenAIChatMessage {
-  role: "system" | "user" | "assistant" | "developer";
+  role: "system" | "user" | "assistant" | "developer" | "tool";
   content: OpenAIMessageContent;
+  // assistant messages may carry the tool calls the model requested
+  tool_calls?: OpenAIToolCall[];
+  // role:"tool" messages carry the result of a prior tool call
+  tool_call_id?: string;
+  // optional function name on tool/assistant messages
+  name?: string;
 }
 
 export interface OpenAIChatRequest {
@@ -29,15 +64,18 @@ export interface OpenAIChatRequest {
   frequency_penalty?: number;
   presence_penalty?: number;
   user?: string; // Used for session mapping
+  tools?: OpenAITool[];
+  tool_choice?: OpenAIToolChoice;
 }
 
 export interface OpenAIChatResponseChoice {
   index: number;
   message: {
     role: "assistant";
-    content: string;
+    content: string | null;
+    tool_calls?: OpenAIToolCall[];
   };
-  finish_reason: "stop" | "length" | "content_filter" | null;
+  finish_reason: "stop" | "length" | "content_filter" | "tool_calls" | null;
 }
 
 export interface OpenAIChatResponse {
@@ -56,12 +94,13 @@ export interface OpenAIChatResponse {
 export interface OpenAIChatChunkDelta {
   role?: "assistant";
   content?: string;
+  tool_calls?: Array<OpenAIToolCall & { index: number }>;
 }
 
 export interface OpenAIChatChunkChoice {
   index: number;
   delta: OpenAIChatChunkDelta;
-  finish_reason: "stop" | "length" | "content_filter" | null;
+  finish_reason: "stop" | "length" | "content_filter" | "tool_calls" | null;
 }
 
 export interface OpenAIChatChunk {
