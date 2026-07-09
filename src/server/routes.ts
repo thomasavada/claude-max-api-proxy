@@ -138,7 +138,12 @@ export async function handleChatCompletions(
     const cliInput = openaiToCli(body);
     const subprocess = new ClaudeSubprocess();
 
-    if (stream) {
+    if (cliInput.toolMode) {
+      // Tool-calling emulation: we must see the FULL output to parse the
+      // tool-call contract, so we always collect the result (even when the
+      // client asked for a stream) and then re-emit it in the requested shape.
+      await handleToolResponse(res, subprocess, cliInput, requestId, stream);
+    } else if (stream) {
       await handleStreamingResponse(req, res, subprocess, cliInput, requestId);
     } else {
       await handleNonStreamingResponse(res, subprocess, cliInput, requestId);
@@ -357,6 +362,146 @@ async function handleNonStreamingResponse(
             code: null,
           },
         });
+        resolve();
+      });
+  });
+}
+
+/**
+ * Handle tool-calling (function-calling emulation) requests.
+ *
+ * The subprocess runs with its own tools disabled; we collect the full result,
+ * parse the tool-call contract, and emit an OpenAI-shaped response. Honors the
+ * client's `stream` flag by re-emitting the collected result as a single SSE
+ * message (we cannot stream partial deltas without leaking the contract text).
+ */
+async function handleToolResponse(
+  res: Response,
+  subprocess: ClaudeSubprocess,
+  cliInput: ReturnType<typeof openaiToCli>,
+  requestId: string,
+  stream: boolean
+): Promise<void> {
+  return new Promise((resolve) => {
+    let finalResult: ClaudeCliResult | null = null;
+
+    subprocess.on("result", (result: ClaudeCliResult) => {
+      finalResult = result;
+    });
+
+    subprocess.on("error", (error: Error) => {
+      console.error("[ToolMode] Error:", error.message);
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: { message: error.message, type: "server_error", code: null },
+        });
+      }
+      resolve();
+    });
+
+    subprocess.on("close", (code: number | null) => {
+      if (!finalResult) {
+        if (!res.headersSent) {
+          res.status(500).json({
+            error: {
+              message: `Claude CLI exited with code ${code} without response`,
+              type: "server_error",
+              code: null,
+            },
+          });
+        }
+        resolve();
+        return;
+      }
+
+      const completion = cliResultToOpenai(finalResult, requestId, {
+        toolMode: true,
+      });
+
+      if (!stream) {
+        res.json(completion);
+        resolve();
+        return;
+      }
+
+      // Stream shape: emit the finished message as SSE (single logical chunk).
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      res.flushHeaders?.();
+
+      const choice = completion.choices[0];
+      const model = completion.model;
+      const base = {
+        id: `chatcmpl-${requestId}`,
+        object: "chat.completion.chunk" as const,
+        created: Math.floor(Date.now() / 1000),
+        model,
+      };
+
+      if (choice.message.tool_calls) {
+        res.write(
+          `data: ${JSON.stringify({
+            ...base,
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  role: "assistant",
+                  tool_calls: choice.message.tool_calls.map((tc, index) => ({
+                    index,
+                    ...tc,
+                  })),
+                },
+                finish_reason: null,
+              },
+            ],
+          })}\n\n`
+        );
+        res.write(
+          `data: ${JSON.stringify({
+            ...base,
+            choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+          })}\n\n`
+        );
+      } else {
+        res.write(
+          `data: ${JSON.stringify({
+            ...base,
+            choices: [
+              {
+                index: 0,
+                delta: { role: "assistant", content: choice.message.content || "" },
+                finish_reason: null,
+              },
+            ],
+          })}\n\n`
+        );
+        res.write(
+          `data: ${JSON.stringify({
+            ...base,
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          })}\n\n`
+        );
+      }
+      res.write("data: [DONE]\n\n");
+      res.end();
+      resolve();
+    });
+
+    subprocess
+      .start(cliInput.prompt, {
+        model: cliInput.model,
+        sessionId: cliInput.sessionId,
+        systemPrompt: cliInput.systemPrompt,
+        toolMode: true,
+      })
+      .catch((error) => {
+        if (!res.headersSent) {
+          res.status(500).json({
+            error: { message: error.message, type: "server_error", code: null },
+          });
+        }
         resolve();
       });
   });

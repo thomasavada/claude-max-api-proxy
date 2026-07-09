@@ -3,6 +3,7 @@
  */
 
 import type { OpenAIChatRequest, OpenAIMessageContent } from "../types/openai.js";
+import { buildToolSystemPrompt, renderToolConversation } from "./tools.js";
 
 export type ClaudeModel = "opus" | "sonnet" | "haiku" | string;
 
@@ -11,6 +12,12 @@ export interface CliInput {
   model: ClaudeModel;
   sessionId?: string;
   systemPrompt?: string;
+  /**
+   * True when the caller supplied OpenAI `tools`. In this mode the subprocess
+   * runs with its own tools disabled and the response is parsed for emulated
+   * tool calls. See adapter/tools.ts.
+   */
+  toolMode?: boolean;
 }
 
 const MODEL_MAP: Record<string, ClaudeModel> = {
@@ -140,6 +147,23 @@ export function systemPromptFrom(messages: OpenAIChatRequest["messages"]): strin
  * Convert OpenAI chat request to CLI input format
  */
 export function openaiToCli(request: OpenAIChatRequest): CliInput {
+  // ── Tool / function-calling mode ──────────────────────────────────────────
+  // Only engaged when the caller sent a non-empty `tools` array. Everything
+  // else takes the original, unchanged path below.
+  if (request.tools && request.tools.length > 0) {
+    return {
+      prompt: renderToolConversation(request.messages),
+      model: extractModel(request.model),
+      sessionId: request.user,
+      systemPrompt: buildToolSystemPrompt(
+        request.tools,
+        request.tool_choice,
+        systemPromptFrom(request.messages)
+      ),
+      toolMode: true,
+    };
+  }
+
   return {
     prompt: messagesToPrompt(request.messages),
     model: extractModel(request.model),
